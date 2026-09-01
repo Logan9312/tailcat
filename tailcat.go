@@ -361,6 +361,13 @@ type Server struct {
 	// It must be set before calling Start.
 	OnTCP func(port uint16) (handler func(net.Conn))
 
+	// OnTCPPeer, if non-nil, is the peer-aware form of OnTCP. The peer is
+	// the admitted WireGuard node key which originated the connection. It
+	// takes precedence over OnTCP when both are set.
+	//
+	// It must be set before calling Start.
+	OnTCPPeer func(port uint16, peer key.NodePublic) (handler func(net.Conn))
+
 	// OnTCPForward, if non-nil, specifies a func that returns a handler to handle
 	// incoming connections to the provided IP:port. If nil or if it returns nil,
 	// then a RST is sent.
@@ -486,6 +493,14 @@ func (s *Server) Start() error {
 	ns.ProcessSubnets = true
 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 		if dst.Addr() == lb.addr {
+			if s.OnTCPPeer != nil {
+				peer, ok := lb.peerByIP(src.Addr())
+				if !ok {
+					logf("tailcat: no admitted peer for TCP source %v", src.Addr())
+					return nil, true
+				}
+				return s.OnTCPPeer(dst.Port(), peer), true
+			}
 			if s.OnTCP == nil {
 				return nil, true // send RST
 			}

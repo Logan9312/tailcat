@@ -115,6 +115,54 @@ func TestTailcat(t *testing.T) {
 
 }
 
+func TestOnTCPPeerReportsAdmittedNodeKey(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+	clientKey := key.NewNode()
+	observed := make(chan key.NodePublic, 1)
+	server := &Server{
+		Key:            key.NewNode(),
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		AllowedClients: []key.NodePublic{clientKey.Public()},
+	}
+	server.OnTCPPeer = func(port uint16, peer key.NodePublic) func(net.Conn) {
+		if port != 80 {
+			return nil
+		}
+		return func(conn net.Conn) {
+			observed <- peer
+			conn.Close()
+		}
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+
+	client := &Client{Server: server.ConnBlob(), Key: clientKey, Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { client.Close() })
+	WaitForDERPForTest(t, server, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	select {
+	case got := <-observed:
+		if got != clientKey.Public() {
+			t.Fatalf("admitted peer = %v, want %v", got, clientKey.Public())
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
 // TestHalfClose tests that a client's write shutdown (CloseWrite)
 // propagates through the server's TCP proxying as a half-close
 // rather than tearing down the whole connection: the backend must
