@@ -163,6 +163,64 @@ func TestOnTCPPeerReportsAdmittedNodeKey(t *testing.T) {
 	}
 }
 
+func TestReplaceAllowedClientsRevokesLivePeer(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+	oldKey := key.NewNode()
+	newKey := key.NewNode()
+	server := &Server{
+		Key:            key.NewNode(),
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		AllowedClients: []key.NodePublic{oldKey.Public()},
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+
+	if !server.lb.onMeow(oldKey.Public(), discoPrivateForNode(oldKey).Public()) {
+		t.Fatal("initially allowed peer was rejected")
+	}
+	if err := server.ReplaceAllowedClients([]key.NodePublic{newKey.Public()}); err != nil {
+		t.Fatal(err)
+	}
+	server.lb.mu.Lock()
+	_, oldPresent := server.lb.clients[oldKey.Public()]
+	_, newAllowed := server.lb.allowedClients[newKey.Public()]
+	peerCount := len(server.lb.nm.Peers)
+	server.lb.mu.Unlock()
+	if oldPresent {
+		t.Fatal("revoked peer remained in live client map")
+	}
+	if !newAllowed || peerCount != 0 {
+		t.Fatalf("replacement state = new allowed %v, peers %d; want true, 0", newAllowed, peerCount)
+	}
+	if server.lb.onMeow(oldKey.Public(), discoPrivateForNode(oldKey).Public()) {
+		t.Fatal("revoked peer was readmitted")
+	}
+	if !server.lb.onMeow(newKey.Public(), discoPrivateForNode(newKey).Public()) {
+		t.Fatal("replacement peer was rejected")
+	}
+	server.lb.mu.Lock()
+	_, newPresent := server.lb.clients[newKey.Public()]
+	peerCount = len(server.lb.nm.Peers)
+	server.lb.mu.Unlock()
+	if !newPresent || peerCount != 1 {
+		t.Fatalf("replacement peer state = present %v, peers %d; want true, 1", newPresent, peerCount)
+	}
+}
+
+func TestReplaceAllowedClientsRequiresStartedServer(t *testing.T) {
+	var server Server
+	if err := server.ReplaceAllowedClients(nil); err == nil {
+		t.Fatal("ReplaceAllowedClients before Start succeeded")
+	}
+}
+
 // TestHalfClose tests that a client's write shutdown (CloseWrite)
 // propagates through the server's TCP proxying as a half-close
 // rather than tearing down the whole connection: the backend must

@@ -705,6 +705,44 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 	mak.Set(&s.lb.allowedClients, k, true)
 }
 
+// ReplaceAllowedClients atomically replaces the set of client node keys which may
+// connect. Unlike an empty AllowedClients field at startup, an empty replacement
+// denies every client. Peers removed by the replacement are also removed from the
+// live network map, so their WireGuard configuration can no longer be resolved.
+//
+// It must only be called after [Server.Start]. Application owners remain
+// responsible for closing already-accepted TCP connections belonging to a removed
+// peer.
+func (s *Server) ReplaceAllowedClients(keys []key.NodePublic) error {
+	if s.lb == nil {
+		return errors.New("tailcat: Server.ReplaceAllowedClients called before Start")
+	}
+	allowed := make(map[key.NodePublic]bool, len(keys))
+	for _, k := range keys {
+		if k.IsZero() {
+			return errors.New("tailcat: zero client key in replacement allowlist")
+		}
+		allowed[k] = true
+	}
+
+	lb := s.lb
+	lb.mu.Lock()
+	lb.allowedClients = allowed
+	for k := range lb.clients {
+		if !allowed[k] {
+			delete(lb.clients, k)
+		}
+	}
+	nm := lb.serverNetworkMapLocked()
+	lb.nm = nm
+	lb.mu.Unlock()
+
+	lb.sys.MagicSock.Get().SetNetworkMap(nm.SelfNode, nm.Peers)
+	lb.sys.Netstack.Get().UpdateNetstackIPs(nm)
+	go lb.advertiseEndpoints()
+	return nil
+}
+
 // ConnBlob returns the token that clients use to connect to this
 // server. It embeds the full DERP region, so clients don't need to
 // fetch the DERP map from the network. It must only be called after
@@ -1386,10 +1424,15 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	if _, ok := b.clients[src]; ok {
 		return true
 	}
-	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
+	id := tailcfg.NodeID(2) // server is ID 1, clients start at ID 2.
+	for _, n := range b.clients {
+		if n.ID >= id {
+			id = n.ID + 1
+		}
+	}
 	derpRegion := b.derpRegionID()
 	mak.Set(&b.clients, src, &tailcfg.Node{
-		ID:         tailcfg.NodeID(id),
+		ID:         id,
 		StableID:   tailcfg.StableNodeID(fmt.Sprint(id)),
 		Name:       fmt.Sprintf("client%d.tailcat.", id),
 		User:       100,
@@ -1400,6 +1443,26 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 		HomeDERP:   derpRegion,
 	})
 
+	nm := b.serverNetworkMapLocked()
+	b.nm = nm
+
+	mc := b.sys.MagicSock.Get()
+	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
+	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
+
+	// No engine reconfig needed: the WireGuard device learns about the
+	// new peer lazily via the config source installed with
+	// SetPeerConfigFunc when the client's handshake arrives.
+
+	// Tell the new client our UDP endpoints so both sides can attempt
+	// a direct path. Async because advertiseEndpoints takes b.mu.
+	go b.advertiseEndpoints()
+	return true
+}
+
+// serverNetworkMapLocked returns the current server network map. b.mu must be held.
+func (b *locoBackend) serverNetworkMapLocked() *netmap.NetworkMap {
+	derpRegion := b.derpRegionID()
 	nm := &netmap.NetworkMap{
 		NodeKey: b.pub,
 		SelfNode: (&tailcfg.Node{
@@ -1420,20 +1483,7 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	slices.SortFunc(nm.Peers, func(a, b tailcfg.NodeView) int {
 		return cmp.Compare(a.ID(), b.ID())
 	})
-	b.nm = nm
-
-	mc := b.sys.MagicSock.Get()
-	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
-	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
-
-	// No engine reconfig needed: the WireGuard device learns about the
-	// new peer lazily via the config source installed with
-	// SetPeerConfigFunc when the client's handshake arrives.
-
-	// Tell the new client our UDP endpoints so both sides can attempt
-	// a direct path. Async because advertiseEndpoints takes b.mu.
-	go b.advertiseEndpoints()
-	return true
+	return nm
 }
 
 func (b *locoBackend) Status() *ipnstate.Status {
